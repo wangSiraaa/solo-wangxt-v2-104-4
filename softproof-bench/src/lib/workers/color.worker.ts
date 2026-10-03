@@ -9,11 +9,14 @@
  *  -> { type: 'sample', id, imageBytes, sourceIcc, targetIcc, params, x, y }
  *  <-  { type: 'sample-result', id, info?, error? }
  *
+ *  -> { type: 'sample-batch', id, imageBytes, sourceIcc, targetIcc, params, points }
+ *  <-  { type: 'sample-batch-result', id, infos?, error? }
+ *
  * Profiles and images arrive as ArrayBuffers (zero-copy transfer when sent
  * from the caller with a transfer list; here we clone to keep originals).
  */
 import { decodeImage } from '../codec/decode';
-import { convert, samplePixel } from '../color/engine';
+import { convert, samplePixel, samplePixels } from '../color/engine';
 import type { EngineParams } from '../color/engine';
 
 declare const self: DedicatedWorkerGlobalScope;
@@ -36,7 +39,16 @@ export interface SampleRequest {
   x: number;
   y: number;
 }
-export type WorkerRequest = ConvertRequest | SampleRequest;
+export interface SampleBatchRequest {
+  type: 'sample-batch';
+  id: number;
+  imageBytes: ArrayBuffer;
+  sourceIcc: ArrayBuffer;
+  targetIcc: ArrayBuffer;
+  params: EngineParams;
+  points: { x: number; y: number }[];
+}
+export type WorkerRequest = ConvertRequest | SampleRequest | SampleBatchRequest;
 
 self.onmessage = async (ev: MessageEvent<WorkerRequest>) => {
   const msg = ev.data;
@@ -58,13 +70,16 @@ self.onmessage = async (ev: MessageEvent<WorkerRequest>) => {
         },
         transferableOf(result),
       );
+    } else if (msg.type === 'sample-batch') {
+      const infos = await samplePixels(decoded, profiles, msg.params, msg.points);
+      self.postMessage({ type: 'sample-batch-result', id: msg.id, infos });
     } else {
       const info = await samplePixel(decoded, profiles, msg.params, msg.x, msg.y);
       self.postMessage({ type: 'sample-result', id: msg.id, info });
     }
   } catch (err) {
     self.postMessage({
-      type: msg.type === 'sample' ? 'sample-result' : 'result',
+      type: msg.type === 'sample' ? 'sample-result' : msg.type === 'sample-batch' ? 'sample-batch-result' : 'result',
       id: msg.id,
       error: err instanceof Error ? err.message : String(err),
     });

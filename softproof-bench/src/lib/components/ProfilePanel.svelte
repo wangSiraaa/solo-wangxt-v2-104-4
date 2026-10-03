@@ -119,7 +119,7 @@
 
       <label class="field">
         渲染意图（Rendering Intent）
-        <select bind:value={s.intent} onchange={() => (s.result = null)}>
+        <select bind:value={s.intent} onchange={() => app.invalidate()}>
           {#each intents as i}
             <option value={i}>{INTENT_LABEL[i]}</option>
           {/each}
@@ -127,13 +127,13 @@
       </label>
 
       <label class="row check">
-        <input type="checkbox" bind:checked={s.blackPointCompensation} onchange={() => (s.result = null)} />
+        <input type="checkbox" bind:checked={s.blackPointCompensation} onchange={() => app.invalidate()} />
         <span>黑点补偿（Black Point Compensation）</span>
       </label>
 
       <label class="field">
         软打样模拟意图（目标→显示器，通常固定相对色度）
-        <select bind:value={s.proofIntent}>
+        <select bind:value={s.proofIntent} onchange={() => app.invalidate()}>
           <option value="relative-colorimetric">相对色度（标准软打样）</option>
           <option value="absolute-colorimetric">绝对色度（模拟纸白）</option>
           <option value="perceptual">感知式</option>

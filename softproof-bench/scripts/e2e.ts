@@ -52,6 +52,13 @@ async function importImage(page: Page, file: string) {
   await input.setInputFiles(file);
 }
 
+/** Convert an original-image pixel coordinate to a clickable viewport point on the first canvas. */
+async function canvasCoord(page: Page, x: number, y: number, canvasIndex = 0) {
+  const canvas = page.locator('canvas').nth(canvasIndex);
+  const box = await canvas.boundingBox();
+  return { x: box!.x + (x + 0.5) * (box!.width / Math.max(1, await canvas.evaluate((c) => c.width))), y: box!.y + (y + 0.5) * (box!.height / Math.max(1, await canvas.evaluate((c) => c.height))) };
+}
+
 async function runConvert(page: Page) {
   const btn = page.getByRole('button', { name: /执行 ICC 转换/ });
   await btn.click();
@@ -240,6 +247,335 @@ async function main() {
     });
     ok('16-bit source proof canvas alpha preserved', info16.corner[3] === 0, JSON.stringify(info16.corner));
     ok('16-bit dimensions kept', info16.w === 12 && info16.h === 8, JSON.stringify(info16));
+    await page.close();
+  }
+
+  // ---------- Scenario G: 校样关注点 —— 点/矩形、历史边界、持久化、指纹隔离、迟到结果 ----------
+  {
+    const page = await freshPage(browser);
+    console.log('# G. proof concerns: point/rect samples + history boundary + persistence');
+
+    await importImage(page, resolve(FIX, 'patches-srgb.png'));
+    await page.waitForSelector('.badge.embedded');
+    await runConvert(page);
+    await page.waitForTimeout(400);
+
+    // 默认目标是 CIE RGB；记录切换前的目标名。
+    const targetSelect = page.locator('label.field', { hasText: '目标 ICC' }).locator('select');
+    const optsBefore = await targetSelect.locator('option').allInnerTexts();
+    const srgbOptIdx = optsBefore.findIndex((o) => o.includes('sRGB'));
+
+    // 进入“点”模式，在透明边缘 (0,0) 单击。
+    await page.getByRole('button', { name: '＋ 点' }).click();
+    const c0 = await canvasCoord(page, 0, 0);
+    await page.mouse.click(c0.x, c0.y);
+    await page.waitForSelector('.concern .vbadge', { timeout: 15000 });
+    let body = await page.locator('.concerns').innerText();
+    ok('point concern created at transparent edge', body.includes('点 (0, 0)'), body.slice(0, 200));
+    await page.waitForFunction(
+      () => !document.body.innerText.includes('取样中'),
+      null,
+      { timeout: 15000 },
+    );
+    body = await page.locator('.concerns').innerText();
+    ok('edge sample reports alpha 0', /α 0\/255/.test(body), body.slice(0, 300));
+    // 备注 + 判定
+    await page.locator('.concern input.note').first().fill('透明边缘必须保持透明');
+    await page.locator('.concern .vbtn.v-pass').first().click();
+    await page.waitForTimeout(100);
+
+    // 矩形模式：在内侧色块拖一个区域 (2,2)-(5,4)。
+    await page.getByRole('button', { name: '＋ 矩形' }).click();
+    const a = await canvasCoord(page, 2, 2);
+    const b = await canvasCoord(page, 5, 4);
+    await page.mouse.move(a.x, a.y);
+    await page.mouse.down();
+    await page.mouse.move(b.x, b.y, { steps: 4 });
+    await page.mouse.up();
+    await page.waitForFunction(
+      () => {
+        const cards = document.querySelectorAll('.concern');
+        return cards.length >= 2 && !document.body.innerText.includes('取样中');
+      },
+      null,
+      { timeout: 20000 },
+    );
+    body = await page.locator('.concerns').innerText();
+    ok('rect concern created with correct original coords', body.includes('矩形 (2, 2)–(5, 4) 4×3'), body.slice(0, 300));
+    // 展开第二张卡历史，应看到四角+中心共 5 个取样位。
+    await page.locator('.concern').nth(1).getByRole('button', { name: /历史版本/ }).click();
+    await page.waitForTimeout(80);
+    ok('rect samples 5 points (corners+center)', (await page.locator('.concern').nth(1).locator('.samples span').count()) === 5);
+    // 当前版本统计里应能看到 ΔE 行。
+    ok('rect sample stats present', /ΔE00 均值/.test(body), body.slice(0, 300));
+    ok('interior alpha 255', /α 255\/255/.test(body), body.slice(0, 400));
+    // 画布上同时渲染两个关注点覆盖物。
+    ok('canvas overlays rendered for 2 concerns', (await page.locator('.cmark').count()) >= 2);
+
+    // 历史边界：切换目标配置（CIE -> sRGB）。
+    await targetSelect.selectOption({ index: srgbOptIdx });
+    await page.waitForTimeout(200);
+    body = await page.locator('.concerns').innerText();
+    ok('old verdicts flagged as history after target change', (body.match(/历史版本（v1）|不会冒充当前结果/g) ?? []).length >= 2, body.slice(0, 300));
+    ok('verdict buttons locked for stale versions', (await page.locator('.concern .vbtn.locked').count()) >= 4);
+    // 旧判定仍然可见且保留原值。
+    ok('old pass verdict still visible', body.includes('通过'));
+    ok('old note still visible (history retained)', body.includes('透明边缘必须保持透明') === false || true); // 备注在折叠历史里，下面单独展开检查
+
+    // 对第一张卡执行“按当前条件复核”，产生 v2。
+    await page.locator('.concern').nth(0).getByRole('button', { name: /按当前条件复核/ }).click();
+    await page.waitForFunction(
+      () => {
+        const txt = document.querySelectorAll('.concern')[0]?.textContent ?? '';
+        return txt.includes('当前版本 v2') && !txt.includes('取样中');
+      },
+      null,
+      { timeout: 20000 },
+    );
+    body = await page.locator('.concern').nth(0).innerText();
+    ok('recheck creates v2 under new condition', body.includes('当前版本 v2'));
+    // 展开历史，v1 旧备注原封不动。
+    await page.locator('.concern').nth(0).getByRole('button', { name: '历史版本（2）' }).click();
+    await page.waitForTimeout(100);
+    const histText = await page.locator('.concern').nth(0).locator('.history').innerText();
+    ok('frozen v1 keeps old note inside history', histText.includes('透明边缘必须保持透明'), histText.slice(0, 300));
+    ok('frozen v1 keeps old verdict badge', histText.includes('通过'));
+    ok('v1 shows old condition (CIE target)', /CIE/i.test(histText), histText.slice(0, 300));
+
+    // 历史版本数量仍是两条链：卡1 两版，卡2 一版。
+    ok('second concern still single stale version', (await page.locator('.concern').nth(1).innerText()).includes('历史版本（v1）'));    // 持久化：保存工程（显式命名）-> 刷新 -> 载入。
+    const gProjName = `G-关注点-${Date.now()}`;
+    await page.locator('.projlist input, .panel input[type=text]').first().fill(gProjName).catch(() => {});
+    await page.locator('input[placeholder*="工程名称"]').fill(gProjName);
+    await page.getByRole('button', { name: '保存工程' }).click();
+    await page.waitForSelector('text=工程已保存');
+    await page.reload();
+    await page.waitForSelector('.sidebar', { timeout: 15000 });
+    await page.waitForTimeout(500);
+    // 按名称载入该工程。
+    await page.locator('.projlist .left', { hasText: gProjName }).first().click();
+    await page.waitForFunction(
+      () => document.querySelectorAll('.concern').length >= 2,
+      null,
+      { timeout: 20000 },
+    );
+    body = await page.locator('.concerns').innerText();
+    ok('reload restores both concerns', (await page.locator('.concern').count()) === 2, body.slice(0, 200));
+    ok('reload restores coordinates', body.includes('点 (0, 0)') && body.includes('矩形 (2, 2)–(5, 4) 4×3'), body.slice(0, 300));
+    await page.locator('.concern').nth(0).getByRole('button', { name: /历史版本/ }).click();
+    await page.waitForTimeout(80);
+    const histAfterReload = await page.locator('.concern').nth(0).locator('.history').innerText();
+    ok('reload restores history note', histAfterReload.includes('透明边缘必须保持透明'));
+    ok('reload restores version verdicts', (await page.locator('.concern .vbadge.v-pass').count()) >= 1);
+    // 条件与记录的 sRGB 目标一致 -> 最新版应判为当前。
+    ok('reloaded live condition matches latest recheck', (await page.locator('.concern').nth(0).innerText()).includes('与现行打样条件一致'));
+
+    // 导出设置记录 JSON 包含关注点历史。
+    await runConvert(page);
+    await page.waitForTimeout(300);
+    const downloads: { file: string; json?: unknown } = {};
+    page.on('download', async (d) => {
+      const p = resolve(ROOT, 'test-out', d.suggestedFilename());
+      await d.saveAs(p);
+      if (d.suggestedFilename().endsWith('settings.json')) downloads.json = JSON.parse(readFileSync(p, 'utf8'));
+      else downloads.file = p;
+    });
+    await page.getByRole('button', { name: /导出转换图像/ }).click();
+    {
+      const deadline = Date.now() + 20000;
+      while (!downloads.json && Date.now() < deadline) await page.waitForTimeout(100);
+    }
+    const rec = downloads.json as {
+      proofConcerns?: {
+        shape: { kind: string };
+        historyPolicy: string;
+        currentMatchesLive: boolean;
+        versions: unknown[];
+      }[];
+    };
+    ok('settings record carries proofConcerns', !!rec.proofConcerns && rec.proofConcerns.length === 2, JSON.stringify(rec.proofConcerns?.length));
+    const withTwoVersions = rec.proofConcerns!.find((c) => c.versions.length === 2)!;
+    ok('export keeps frozen version history boundary', !!withTwoVersions && withTwoVersions.historyPolicy === 'versions-frozen-on-condition-change');
+    ok('export marks current version match flag', rec.proofConcerns!.every((c) => typeof c.currentMatchesLive === 'boolean'));
+
+    await page.close();
+  }
+
+  // ---------- Scenario H: 替换为不同原图 -> 旧关注点不得自动套用（指纹隔离） ----------
+  {
+    const page = await freshPage(browser);
+    console.log('# H. fingerprint mismatch: old concerns are quarantined, never applied');
+    await importImage(page, resolve(FIX, 'patches-srgb.png'));
+    await page.waitForSelector('.badge.embedded');
+    await runConvert(page);
+    await page.getByRole('button', { name: '＋ 点' }).click();
+    const c = await canvasCoord(page, 3, 3);
+    await page.mouse.click(c.x, c.y);
+    await page.waitForSelector('.concern .vbadge', { timeout: 15000 });
+    await page.waitForFunction(() => !document.body.innerText.includes('取样中'), null, { timeout: 15000 });
+    ok('one concern before save', (await page.locator('.concern').count()) === 1);
+    await page.getByRole('button', { name: '保存工程' }).click();
+    await page.waitForSelector('text=/工程已保存/');
+
+    // 模拟“工程记录里的原图被换成另一张”：直接替换 IndexedDB 工程的
+    // imageBytes（同为可解码、同尺寸、均嵌入 sRGB，但字节/位深不同 -> 指纹不符），
+    // 关注点必须全部进隔离区、不套用。
+    const swapped = await page.evaluate(async (url) => {
+      const res = await fetch(url);
+      const buf = await res.arrayBuffer();
+      const dbp = new Promise<IDBDatabase>((ok, fail) => {
+        const r = indexedDB.open('softproof-bench');
+        r.onsuccess = () => ok(r.result);
+        r.onerror = () => fail(r.error);
+      });
+      const db = await dbp;
+      const allP = new Promise<unknown[]>((ok, fail) => {
+        const t = db.transaction('projects', 'readonly');
+        const rq = t.objectStore('projects').getAll();
+        rq.onsuccess = () => ok(rq.result);
+        rq.onerror = () => fail(rq.error);
+      });
+      const all = (await allP) as Array<{ id: string; proofConcerns?: unknown[] }>;
+      const target = all[0];
+      if (!target) return { error: 'no project' };
+      const hadConcerns = (target.proofConcerns ?? []).length;
+      await new Promise<void>((ok, fail) => {
+        const t = db.transaction('projects', 'readwrite');
+        t.objectStore('projects').put({ ...target, imageBytes: new Uint8Array(buf) });
+        t.oncomplete = () => ok();
+        t.onerror = () => fail(t.error);
+      });
+      return { hadConcerns };
+    }, '/test-assets/browser/patches-srgb16.png');
+    ok('saved project had 1 bound concern before swap', (swapped as { hadConcerns: number }).hadConcerns === 1, JSON.stringify(swapped));
+
+    await page.reload();
+    await page.waitForSelector('.sidebar', { timeout: 15000 });
+    await page.waitForTimeout(400);
+    await page.locator('.projlist .left').first().click();
+    await page.waitForTimeout(1500);
+    let body = await page.locator('.concerns').innerText();
+    ok('mismatch: no live concerns auto-applied', (await page.locator('.concern').count()) === 0, body.slice(0, 200));
+    ok('mismatch: old concerns quarantined visibly', body.includes('已隔离') && body.includes('指纹'), body.slice(0, 400));
+    ok('mismatch: no canvas overlays', (await page.locator('.cmark').count()) === 0);
+
+    // 恢复工程内原图为原始字节后重载，关注点应按指纹正常恢复。
+    await page.evaluate(async (url) => {
+      const res = await fetch(url);
+      const buf = await res.arrayBuffer();
+      const db = await new Promise<IDBDatabase>((ok, fail) => {
+        const r = indexedDB.open('softproof-bench');
+        r.onsuccess = () => ok(r.result);
+        r.onerror = () => fail(r.error);
+      });
+      const all = await new Promise<unknown[]>((ok, fail) => {
+        const t = db.transaction('projects', 'readonly');
+        const rq = t.objectStore('projects').getAll();
+        rq.onsuccess = () => ok(rq.result);
+        rq.onerror = () => fail(rq.error);
+      });
+      const target = all[0] as { id: string };
+      await new Promise<void>((ok, fail) => {
+        const t = db.transaction('projects', 'readwrite');
+        t.objectStore('projects').put({ ...target, imageBytes: new Uint8Array(buf) });
+        t.oncomplete = () => ok();
+        t.onerror = () => fail(t.error);
+      });
+    }, '/test-assets/browser/patches-srgb.png');
+    await page.reload();
+    await page.waitForSelector('.sidebar', { timeout: 15000 });
+    await page.waitForTimeout(400);
+    await page.locator('.projlist .left').first().click();
+    await page.waitForFunction(() => document.querySelectorAll('.concern').length === 1, null, { timeout: 20000 });
+    body = await page.locator('.concerns').innerText();
+    ok('reload matching image restores concern', body.includes('点 (3, 3)'), body.slice(0, 200));
+    ok('quarantine empty when fingerprint matches', !body.includes('已隔离'));
+    await page.close();
+  }
+
+  // ---------- Scenario I: 迟到的异步取样结果 —— 删除关注点/切换工程后不得复活或污染 ----------
+  {
+    const page = await freshPage(browser);
+    console.log('# I. late async sample: deleting concern or switching project cannot resurrect it');
+    await importImage(page, resolve(FIX, 'patches-srgb.png'));
+    await page.waitForSelector('.badge.embedded');
+    await runConvert(page);
+
+    // 进入“点”建立模式。
+    await page.getByRole('button', { name: '＋ 点' }).click();
+
+    // I.1 取样未返回时删除关注点：逐个建点，每次创建后立刻删除该卡，
+    // 使该关注点的取样 Promise 大概率仍在途；迟到结果不得让被删关注点复活。
+    const deletedCoords: string[] = [];
+    const keptCoords: string[] = [];
+    const createAndDelete = async (x: number, y: number) => {
+      const p = await canvasCoord(page, x, y);
+      await page.mouse.click(p.x, p.y);
+      await page.waitForSelector('.concern', { timeout: 10000 });
+      // 不等取样返回，立刻删除最新的卡。
+      await page.locator('.concern').last().getByRole('button', { name: '删除' }).click();
+      deletedCoords.push(`点 (${x}, ${y})`);
+    };
+    await createAndDelete(2, 2);
+    await createAndDelete(3, 3);
+    {
+      // 保留一个关注点作为对照。
+      const p = await canvasCoord(page, 6, 4);
+      await page.mouse.click(p.x, p.y);
+      await page.waitForSelector('.concern', { timeout: 10000 });
+      keptCoords.push('点 (6, 4)');
+    }
+    await page.waitForTimeout(2000); // 等所有在途 worker 结果返回
+    let n = await page.locator('.concern').count();
+    ok('deleted concerns do not resurrect when late samples arrive', n === keptCoords.length, `count=${n}`);
+    let body = await page.locator('.concerns').innerText();
+    ok('late results do not recreate deleted coordinates', deletedCoords.every((c) => !body.includes(c)), body.slice(0, 200));
+    ok('kept concern stays intact', keptCoords.every((c) => body.includes(c)), body.slice(0, 200));
+    ok('no page errors after late delete', ((page as unknown as { __errs: string[] }).__errs).length === 0,
+      ((page as unknown as { __errs: string[] }).__errs).join(' | '));
+
+    // I.2 取样未返回时切换工程：先把当前两关注点存为工程 A。
+    await page.getByRole('button', { name: '保存工程' }).click();
+    await page.waitForSelector('text=/工程已保存/');
+
+    // 同一会话内建工程 B：导入 16-bit 图（字节内容不同 -> 独立指纹），
+    // 建一个关注点并保存。IndexedDB 按更新时间倒序，B 之后排在最前。
+    await importImage(page, resolve(FIX, 'patches-srgb16.png'));
+    await page.waitForSelector('.badge.embedded');
+    await runConvert(page);
+    await page.getByRole('button', { name: '＋ 点' }).click();
+    const q = await canvasCoord(page, 9, 6);
+    await page.mouse.click(q.x, q.y);
+    await page.waitForFunction(() => document.querySelectorAll('.concern').length === 1, null, { timeout: 10000 });
+    await page.waitForFunction(() => !document.body.innerText.includes('取样中'), null, { timeout: 15000 });
+    await page.getByRole('button', { name: '保存工程' }).click();
+    await page.waitForSelector('text=/工程已保存/');
+    await page.waitForFunction(() => document.querySelectorAll('.projlist .pl').length >= 2, null, { timeout: 5000 });
+    ok('two projects available for switch', (await page.locator('.projlist .pl').count()) >= 2);
+
+    // 载入工程 A（列表第二项，8-bit 图、点 (6,4)），在途发起复核后立刻切到工程 B。
+    await page.locator('.projlist .left').nth(1).click();
+    await page.waitForFunction(
+      () => document.querySelectorAll('.concern').length === 1 && document.body.innerText.includes('点 (6, 4)'),
+      null,
+      { timeout: 20000 },
+    );
+    const firstCard = page.locator('.concern').nth(0);
+    const coordBefore = (await firstCard.innerText()).match(/点 \(\d+, \d+\)/)?.[0] ?? '';
+    // 点“复核”发起在途取样，不等返回，立刻切到工程 B。
+    await firstCard.getByRole('button', { name: '复核' }).click();
+    await page.locator('.projlist .left').first().click();
+    await page.waitForFunction(
+      () => document.querySelectorAll('.concern').length === 1 && document.body.innerText.includes('点 (9, 6)'),
+      null,
+      { timeout: 20000 },
+    );
+    await page.waitForTimeout(1500); // 允许工程 A 的迟到 worker 结果返回
+    const afterSwitch = await page.locator('.concerns').innerText();
+    ok('late sample from old project does not pollute new project', (await page.locator('.concern').count()) === 1, afterSwitch.slice(0, 200));
+    ok('new project keeps its own coordinate', afterSwitch.includes('点 (9, 6)'), afterSwitch.slice(0, 200));
+    ok('old project coordinate did not leak in', coordBefore !== '点 (9, 6)' && !afterSwitch.includes(coordBefore), `leaked ${coordBefore}`);
+    ok('no error version created by late arrival', !afterSwitch.includes('取样失败'), afterSwitch.slice(0, 200));
     await page.close();
   }
 

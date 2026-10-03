@@ -4,6 +4,7 @@
   import ProjectsPanel from './lib/components/ProjectsPanel.svelte';
   import CanvasView from './lib/components/CanvasView.svelte';
   import Sampler from './lib/components/Sampler.svelte';
+  import ConcernsPanel from './lib/components/ConcernsPanel.svelte';
   import ExportBar from './lib/components/ExportBar.svelte';
   import { PROFILE_ATTRIBUTION } from './lib/db/builtinProfiles';
   import type { SampleInfo } from './lib/color/engine';
@@ -12,35 +13,53 @@
   const s = app.state;
   app.init();
 
+  // 原图坐标下的关注点建立模式（与 ConcernsPanel 同步）。
+  let concernMode = $state<'sample' | 'point' | 'rect'>('sample');
+
   // Original pixels rendered as-is (jsquash raw RGBA; the browser is not asked
   // to convert). The transform itself always goes through the worker.
   let originalRGBA = $state<Uint8Array | null>(null);
   let origDims = $state({ w: 0, h: 0 });
-  let lastImageKey = '';
-
   $effect(() => {
-    if (!s.image) {
+    const img = s.image;
+    // 读取 bind epoch：导入图片或载入工程都会使它变化，即使图像字节引用
+    // 恰好相同（如连续两次载入同一工程）也强制重新解码与指纹过闸。
+    const bindEpoch = s.imageBindEpoch;
+    void bindEpoch;
+    if (!img) {
       originalRGBA = null;
       return;
     }
-    const key = s.image.name + s.image.bytes.byteLength;
-    if (key === lastImageKey && originalRGBA) return;
-    lastImageKey = key;
     let cancelled = false;
     void (async () => {
       try {
         const { decodeImage } = await import('./lib/codec/decode');
-        const d = await decodeImage(s.image!.bytes);
+        const d = await decodeImage(img.bytes);
         if (cancelled) return;
-        if (d.channels === 4) {
+        // 指纹/关注点绑定只依赖解码尺寸，必须先于任何画布绘制，
+        // 避免渲染抛错时关注点永远不过闸。
+        app.setImageDims(d.width, d.height);
+        if (d.channels === 4 && d.bitDepth !== 16) {
           originalRGBA = d.data;
         } else {
+          // 16-bit / 无 alpha：一律降采样为 8-bit packed RGBA 供画布显示；
+          // 取样与转换仍走 worker 的原始字节路径，不经过这里。
           const out = new Uint8Array(d.width * d.height * 4);
-          for (let i = 0; i < d.width * d.height; i++) {
-            out[i * 4] = d.data[i * d.channels];
-            out[i * 4 + 1] = d.data[i * d.channels + 1] ?? d.data[i * d.channels];
-            out[i * 4 + 2] = d.data[i * d.channels + 2] ?? d.data[i * d.channels];
-            out[i * 4 + 3] = 255;
+          if (d.bitDepth === 16) {
+            const src16 = d.data16!;
+            for (let i = 0; i < d.width * d.height; i++) {
+              out[i * 4] = src16[i * 4] >> 8;
+              out[i * 4 + 1] = src16[i * 4 + 1] >> 8;
+              out[i * 4 + 2] = src16[i * 4 + 2] >> 8;
+              out[i * 4 + 3] = src16[i * 4 + 3] >> 8;
+            }
+          } else {
+            for (let i = 0; i < d.width * d.height; i++) {
+              out[i * 4] = d.data[i * d.channels];
+              out[i * 4 + 1] = d.data[i * d.channels + 1] ?? d.data[i * d.channels];
+              out[i * 4 + 2] = d.data[i * d.channels + 2] ?? d.data[i * d.channels];
+              out[i * 4 + 3] = 255;
+            }
           }
           originalRGBA = out;
         }
@@ -62,13 +81,15 @@
     clearTimeout(hoverTimer);
     hoverTimer = setTimeout(async () => {
       const seq = ++hoverSeq;
+      // 连同会话纪元一起捕获：切图/切工程后的迟到悬停结果不得显示到新上下文。
+      const epoch = s.sessionEpoch;
       try {
         const info = await app.sample(x, y);
-        if (seq === hoverSeq) s.hover.info = info as SampleInfo | null;
+        if (seq === hoverSeq && epoch === s.sessionEpoch) s.hover.info = info as SampleInfo | null;
       } catch {
-        if (seq === hoverSeq) s.hover.info = null;
+        if (seq === hoverSeq && epoch === s.sessionEpoch) s.hover.info = null;
       } finally {
-        if (seq === hoverSeq) s.hover.pending = false;
+        if (seq === hoverSeq && epoch === s.sessionEpoch) s.hover.pending = false;
       }
     }, 60);
   }
@@ -130,10 +151,16 @@
             rgba={originalRGBA}
             displayMode="original"
             pins={s.pins}
+            concerns={s.concerns}
+            selectedConcernId={s.selectedConcernId}
+            creationMode={concernMode}
             hover={{ x: s.hover.x, y: s.hover.y }}
             onmove={onMove}
             onleave={onLeave}
             onpin={(x, y) => app.pin(x, y)}
+            onCreatePoint={(x, y) => app.createPointConcern(x, y)}
+            onCreateRect={(x0, y0, x1, y1) => app.createRectConcern(x0, y0, x1, y1)}
+            onSelectConcern={(id) => app.selectConcern(id)}
             accent="#8fd3ff"
           />
           <CanvasView
@@ -146,10 +173,16 @@
             rgba={s.result?.softProofRGBA ?? null}
             displayMode="softproof"
             pins={s.pins}
+            concerns={s.concerns}
+            selectedConcernId={s.selectedConcernId}
+            creationMode={concernMode}
             hover={{ x: s.hover.x, y: s.hover.y }}
             onmove={onMove}
             onleave={onLeave}
             onpin={(x, y) => app.pin(x, y)}
+            onCreatePoint={(x, y) => app.createPointConcern(x, y)}
+            onCreateRect={(x0, y0, x1, y1) => app.createRectConcern(x0, y0, x1, y1)}
+            onSelectConcern={(id) => app.selectConcern(id)}
             accent="#ffb454"
           />
         </div>
@@ -157,6 +190,7 @@
       </section>
 
       <aside class="rightbar scroll">
+        <ConcernsPanel {app} bind:mode={concernMode} />
         <Sampler
           hover={s.hover}
           pins={s.pins.map((p) => ({ x: p.x, y: p.y, info: p.info ?? null, pending: p.pending, error: p.error }))}

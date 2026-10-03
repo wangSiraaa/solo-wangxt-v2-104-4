@@ -6,6 +6,7 @@
  */
 import type { RenderingIntent } from './lcms';
 import type { ColorSpaceKind } from '../icc/profileInfo';
+import type { ExportConcernView } from './concern';
 
 export const PROVENANCE_KEY = 'softproof-bench-conversion';
 export const RECORD_FORMAT = 'softproof-bench-settings/1';
@@ -58,6 +59,13 @@ export interface SettingsRecord {
     embedsTargetICC: boolean;
     fileName: string;
   };
+  /**
+   * 校样关注点（含每个版本的条件快照、取样、ΔE、判定与备注）。
+   * 仅包含绑定到本次导出原图指纹的关注点；历史版本完整保留，
+   * currentVersionId/currentMatchesLive 标明哪一版对应当前条件，
+   * 历史判定绝不冒充当前结果。
+   */
+  proofConcerns?: ExportConcernView[];
   disclaimer: string;
 }
 

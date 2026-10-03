@@ -33,6 +33,7 @@ function ensureWorker(): Worker {
       pending.delete(id);
       if (error) p.reject(new Error(error));
       else if (ev.data.type === 'result') p.resolve(toConverted(ev.data.result));
+      else if (ev.data.type === 'sample-batch-result') p.resolve(ev.data.infos as SampleInfo[]);
       else p.resolve(ev.data.info as SampleInfo);
     };
     worker.onerror = (e) => {
@@ -102,17 +103,27 @@ export function runSample(opts: {
   x: number;
   y: number;
 }): Promise<SampleInfo> {
+  return runSampleBatch({ ...opts, points: [{ x: opts.x, y: opts.y }] }).then((r) => r[0]);
+}
+
+/** Batch sampling (several pixels share one worker decode/profile open). */
+export function runSampleBatch(opts: {
+  imageBytes: Uint8Array;
+  sourceIcc: Uint8Array;
+  targetIcc: Uint8Array;
+  params: EngineParams;
+  points: { x: number; y: number }[];
+}): Promise<SampleInfo[]> {
   const w = ensureWorker();
   const id = seq++;
   const payload = {
-    type: 'sample' as const,
+    type: 'sample-batch' as const,
     id,
     imageBytes: copy(ab(opts.imageBytes)),
     sourceIcc: copy(ab(opts.sourceIcc)),
     targetIcc: copy(ab(opts.targetIcc)),
     params: opts.params,
-    x: opts.x,
-    y: opts.y,
+    points: opts.points,
   };
   return new Promise((resolve, reject) => {
     pending.set(id, { resolve: resolve as (v: unknown) => void, reject });

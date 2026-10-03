@@ -8,6 +8,7 @@
  */
 import type { RenderingIntent } from '../color/lcms';
 import type { ColorSpaceKind } from '../icc/profileInfo';
+import type { ProofConcern } from '../color/concern';
 
 const DB_NAME = 'softproof-bench';
 const DB_VERSION = 1;
@@ -39,7 +40,16 @@ export interface StoredProject {
   targetProfileId: string | null;
   intent: RenderingIntent;
   blackPointCompensation: boolean;
+  /** 软打样模拟意图随工程一起恢复（旧工程缺省相对色度）。 */
+  proofIntent?: RenderingIntent;
   provenanceSeen?: boolean; // image already carried a conversion marker
+  /**
+   * 校样关注点，历史版本（条件快照 + 取样 + 判定 + 备注）完整持久化。
+   * quarantineConcerns 是曾随旧原图保存、但当前图像指纹不匹配的关注点：
+   * 保留但绝不自动套用/渲染，防止换图后关注点漂移。
+   */
+  proofConcerns?: ProofConcern[];
+  quarantineConcerns?: ProofConcern[];
   previewCache?: {
     paramsKey: string;
     rgba: Uint8Array;

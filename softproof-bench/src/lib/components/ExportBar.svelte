@@ -8,6 +8,7 @@
     type SettingsRecord,
   } from '../color/record';
   import { INTENT_VALUE } from '../color/lcms';
+  import { toExportView } from '../color/concern';
 
   let { app }: { app: AppState } = $props();
   const s = app.state;
@@ -70,6 +71,9 @@
         },
         // filled by buildExport
         export: { kind: 'rgb-png', bitDepth: s.result.bitDepth, embedsTargetICC: true, fileName: '' },
+        // 关注点的完整历史随设置记录导出；每个版本冻结自己的条件快照，
+        // currentMatchesLive 标明最新判定是否仍对应当前条件。
+        proofConcerns: s.concerns.map((c) => toExportView(c, app.concernMatchesLive(c))),
         disclaimer: DISCLAIMER,
       };
 

@@ -206,66 +206,87 @@ export async function samplePixel(
   x: number,
   y: number,
 ): Promise<SampleInfo> {
+  return (await samplePixels(decoded, profiles, params, [{ x, y }]))[0];
+}
+
+/**
+ * Float64 sampling at several pixels in one pass: profiles are opened once and
+ * reused for every pixel. Used by point/rectangle proof concerns so a region
+ * (corners + center) costs a single decode.
+ */
+export async function samplePixels(
+  decoded: DecodedImage,
+  profiles: ProfileSet,
+  params: EngineParams,
+  points: { x: number; y: number }[],
+): Promise<SampleInfo[]> {
+  if (points.length === 0) return [];
   const lcms = await getMod();
   const src = openProfile(lcms, profiles.source.bytes, 'source');
   const dst = openProfile(lcms, profiles.target.bytes, 'target');
   const lab = { handle: lcms.cmsCreateLab4Profile() };
 
   const norm = normalize(decoded);
-  const idx = y * decoded.width + x;
   const max = norm.bitDepth === 16 ? 65535 : 255;
-  const vals: number[] = [];
-  for (let c = 0; c < norm.colorChannels; c++) vals.push(norm.view[idx * (norm.colorChannels + (norm.hasAlpha ? 1 : 0)) + c] / max);
-  let alpha8 = 255;
-  if (norm.hasAlpha) {
-    const a = norm.view[idx * (norm.colorChannels + 1) + norm.colorChannels];
-    alpha8 = norm.bitDepth === 16 ? (a as number) >> 8 : (a as number);
+  const stride = norm.colorChannels + (norm.hasAlpha ? 1 : 0);
+
+  const out: SampleInfo[] = [];
+  for (const { x, y } of points) {
+    const idx = y * decoded.width + x;
+    const vals: number[] = [];
+    for (let c = 0; c < norm.colorChannels; c++) vals.push(norm.view[idx * stride + c] / max);
+    let alpha8 = 255;
+    if (norm.hasAlpha) {
+      const a = norm.view[idx * stride + norm.colorChannels];
+      alpha8 = norm.bitDepth === 16 ? (a as number) >> 8 : (a as number);
+    }
+
+    const sourceLab = transformDouble({
+      mod: lcms,
+      srcHandle: src.handle,
+      dstHandle: lab.handle,
+      srcChannels: src.channels,
+      dstChannels: 3,
+      values: vals,
+      params: { intent: params.intent, blackPointCompensation: params.blackPointCompensation },
+    }) as [number, number, number];
+
+    const targetDevice = transformDouble({
+      mod: lcms,
+      srcHandle: src.handle,
+      dstHandle: dst.handle,
+      srcChannels: src.channels,
+      dstChannels: dst.channels,
+      values: vals,
+      params: { intent: params.intent, blackPointCompensation: params.blackPointCompensation },
+    });
+
+    // Lab through the actual target profile, so numbers reflect the exported
+    // encoding rather than a shortcut straight from the PCS.
+    const targetNorm = targetDevice.map((v) => (dst.colorSpace === 'CMYK' ? v / 100 : v));
+    const targetLab = transformDouble({
+      mod: lcms,
+      srcHandle: dst.handle,
+      dstHandle: lab.handle,
+      srcChannels: dst.channels,
+      dstChannels: 3,
+      values: targetNorm,
+      params: { intent: 'relative-colorimetric', blackPointCompensation: false },
+    }) as [number, number, number];
+
+    out.push({
+      sourceDevice: vals,
+      sourceLab,
+      targetDevice,
+      targetLab,
+      alpha8,
+      sourceColorSpace: src.colorSpace,
+      targetColorSpace: dst.colorSpace,
+    });
   }
-
-  const sourceLab = transformDouble({
-    mod: lcms,
-    srcHandle: src.handle,
-    dstHandle: lab.handle,
-    srcChannels: src.channels,
-    dstChannels: 3,
-    values: vals,
-    params: { intent: params.intent, blackPointCompensation: params.blackPointCompensation },
-  }) as [number, number, number];
-
-  const targetDevice = transformDouble({
-    mod: lcms,
-    srcHandle: src.handle,
-    dstHandle: dst.handle,
-    srcChannels: src.channels,
-    dstChannels: dst.channels,
-    values: vals,
-    params: { intent: params.intent, blackPointCompensation: params.blackPointCompensation },
-  });
-
-  // Lab through the actual target profile, so numbers reflect the exported
-  // encoding rather than a shortcut straight from the PCS.
-  const targetNorm = targetDevice.map((v) => (dst.colorSpace === 'CMYK' ? v / 100 : v));
-  const targetLab = transformDouble({
-    mod: lcms,
-    srcHandle: dst.handle,
-    dstHandle: lab.handle,
-    srcChannels: dst.channels,
-    dstChannels: 3,
-    values: targetNorm,
-    params: { intent: 'relative-colorimetric', blackPointCompensation: false },
-  }) as [number, number, number];
 
   lcms.cmsCloseProfile(src.handle);
   lcms.cmsCloseProfile(dst.handle);
   lcms.cmsCloseProfile(lab.handle);
-
-  return {
-    sourceDevice: vals,
-    sourceLab,
-    targetDevice,
-    targetLab,
-    alpha8,
-    sourceColorSpace: src.colorSpace,
-    targetColorSpace: dst.colorSpace,
-  };
+  return out;
 }
