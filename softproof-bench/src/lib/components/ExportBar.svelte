@@ -2,6 +2,7 @@
   import type { AppState } from '../db/state.svelte';
   import { buildExport, downloadBytes } from '../codec/export';
   import { fnv1a64 } from '../color/hash';
+  import { buildFocusRecord } from '../color/focus';
   import {
     DISCLAIMER,
     RECORD_FORMAT,
@@ -70,6 +71,8 @@
         },
         // filled by buildExport
         export: { kind: 'rgb-png', bitDepth: s.result.bitDepth, embedsTargetICC: true, fileName: '' },
+        // 关注点完整判定历史随记录导出；仅 isCurrent 版本对应本次导出条件。
+        focusPoints: s.focusPoints.length ? buildFocusRecord(s.focusPoints, app.conditionsKey) : undefined,
         disclaimer: DISCLAIMER,
       };
 

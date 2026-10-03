@@ -13,6 +13,17 @@ import { encodeTiffCmyk } from '../src/lib/codec/tiff';
 import { detectProvenance } from '../src/lib/icc/provenance';
 import { deltaE2000 } from '../src/lib/color/colorMath';
 import { fnv1a64 } from '../src/lib/color/hash';
+import {
+  buildFocusRecord,
+  conditionsKeyOf,
+  evaluationAcceptsResult,
+  evaluationForConditions,
+  focusAppliesToImage,
+  reviveFocusPoint,
+  serializeFocusPoint,
+  type FocusPoint,
+  type ProofConditions,
+} from '../src/lib/color/focus';
 
 const root = resolve(import.meta.dirname, '..');
 const outDir = resolve(root, 'test-out');
@@ -145,6 +156,133 @@ check('dE00 black-white ~100', Math.abs(de - 100) < 0.01, String(de));
 check('dE00 identical = 0', deltaE2000({ L: 50, a: 10, b: -10 }, { L: 50, a: 10, b: -10 }) === 0);
 const h1 = fnv1a64(new Uint8Array([1, 2, 3]));
 check('hash stable & hex16', h1.length === 16 && h1 === fnv1a64(new Uint8Array([1, 2, 3])) && h1 !== fnv1a64(new Uint8Array([1, 2, 4])));
+
+console.log('# 校样关注点（focus points）');
+{
+  const condA: ProofConditions = {
+    sourceProfileId: 'embedded:abc',
+    sourceProfileDescription: 'sRGB',
+    sourceIsEmbedded: true,
+    sourceAssumed: false,
+    targetProfileId: 'builtin-ciergb-elle',
+    targetProfileDescription: 'CIE RGB',
+    targetColorSpace: 'RGB',
+    intent: 'relative-colorimetric',
+    blackPointCompensation: true,
+    proofIntent: 'relative-colorimetric',
+  };
+  const keyA = conditionsKeyOf(condA);
+  check('conditions key stable', keyA === conditionsKeyOf({ ...condA }));
+  check(
+    'conditions key reacts to intent',
+    conditionsKeyOf({ ...condA, intent: 'perceptual' }) !== keyA,
+  );
+  check(
+    'conditions key reacts to target profile',
+    conditionsKeyOf({ ...condA, targetProfileId: 'icc-other' }) !== keyA,
+  );
+  check(
+    'conditions key reacts to BPC and proof intent',
+    conditionsKeyOf({ ...condA, blackPointCompensation: false }) !== keyA &&
+      conditionsKeyOf({ ...condA, proofIntent: 'absolute-colorimetric' }) !== keyA,
+  );
+
+  const imgHash = fnv1a64(new Uint8Array([9, 8, 7]));
+  const point: FocusPoint = {
+    id: 'fp-1',
+    createdAt: '2026-10-03T00:00:00.000Z',
+    kind: 'rect',
+    x: 1,
+    y: 1,
+    w: 3,
+    h: 2,
+    label: '区域 1',
+    imageHash: imgHash,
+    imageName: 'patches.png',
+    imageWidth: 12,
+    imageHeight: 8,
+    evaluations: [
+      {
+        id: 'fe-old',
+        createdAt: '2026-10-03T00:00:00.000Z',
+        conditions: condA,
+        conditionsKey: keyA,
+        sample: null,
+        deltaE: 1.23,
+        status: 'pass',
+        note: '旧条件下通过',
+      },
+    ],
+  };
+
+  check('focus point applies only to its image fingerprint', focusAppliesToImage(point, imgHash));
+  check(
+    'focus point rejected on fingerprint mismatch',
+    !focusAppliesToImage(point, fnv1a64(new Uint8Array([9, 8, 8]))),
+  );
+
+  // 条件变更 -> 追加复核版本，旧版本保留
+  const condB: ProofConditions = { ...condA, intent: 'perceptual' };
+  point.evaluations.push({
+    id: 'fe-new',
+    createdAt: '2026-10-03T01:00:00.000Z',
+    conditions: condB,
+    conditionsKey: conditionsKeyOf(condB),
+    sample: null,
+    deltaE: 2.5,
+    status: 'watch',
+    note: '新条件复核',
+  });
+  check('history keeps both versions', point.evaluations.length === 2);
+  check(
+    'current evaluation matches only its own conditions',
+    evaluationForConditions(point, keyA)?.id === 'fe-old' &&
+      evaluationForConditions(point, conditionsKeyOf(condB))?.id === 'fe-new' &&
+      evaluationForConditions(point, 'nonexistent') === undefined,
+  );
+
+  // 序列化剥离 pending；载入后不得有 pending 残留
+  const pendingPoint: FocusPoint = {
+    ...point,
+    evaluations: [{ ...point.evaluations[0], id: 'fe-pending', pending: true }],
+  };
+  const serialized = serializeFocusPoint(pendingPoint);
+  check('serialize strips runtime pending flag', serialized.evaluations[0].pending === undefined);
+  const revived = reviveFocusPoint(JSON.parse(JSON.stringify(serialized)) as FocusPoint);
+  check('revive never restores pending', revived.evaluations[0].pending === false);
+  check(
+    'round-trip keeps judgement history intact',
+    revived.evaluations[0].note === '旧条件下通过' && revived.evaluations[0].status === 'pass',
+  );
+
+  // 迟到结果守卫：只接受仍存在且仍 pending 的判定
+  check(
+    'late result accepted only for pending evaluation',
+    evaluationAcceptsResult(pendingPoint, 'fe-pending')?.id === 'fe-pending',
+  );
+  check(
+    'late result dropped for completed evaluation',
+    evaluationAcceptsResult(point, 'fe-old') === undefined,
+  );
+  check('late result dropped for deleted point', evaluationAcceptsResult(undefined, 'fe-pending') === undefined);
+  check(
+    'late result dropped for unknown evaluation id',
+    evaluationAcceptsResult(pendingPoint, 'nope') === undefined,
+  );
+
+  // 导出记录：历史完整保留，只有当前条件版本被标记
+  const rec = buildFocusRecord([point], conditionsKeyOf(condB));
+  check('export record keeps all versions', rec.length === 1 && rec[0].evaluations.length === 2);
+  check(
+    'export record flags exactly the current-conditions version',
+    rec[0].evaluations.filter((e) => e.isCurrent).length === 1 &&
+      rec[0].evaluations.find((e) => e.isCurrent)?.status === 'watch',
+  );
+  check(
+    'export record carries image fingerprint and coordinates',
+    rec[0].imageHash === imgHash && rec[0].x === 1 && rec[0].w === 3,
+  );
+}
 
 console.log(failures ? `\n${failures} FAILURES` : '\nALL NODE TESTS PASSED');
 process.exit(failures ? 1 : 0);

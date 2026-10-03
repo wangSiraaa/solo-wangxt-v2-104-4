@@ -6,6 +6,7 @@
  */
 import type { RenderingIntent } from './lcms';
 import type { ColorSpaceKind } from '../icc/profileInfo';
+import type { FocusPointRecord } from './focus';
 
 export const PROVENANCE_KEY = 'softproof-bench-conversion';
 export const RECORD_FORMAT = 'softproof-bench-settings/1';
@@ -58,6 +59,12 @@ export interface SettingsRecord {
     embedsTargetICC: boolean;
     fileName: string;
   };
+  /**
+   * 校样关注点：完整判定历史随记录导出。每条判定自带打样条件快照，
+   * 只有 isCurrent=true 的那条对应本记录的转换条件；历史版本不得
+   * 被当作当前结果引用。
+   */
+  focusPoints?: FocusPointRecord[];
   disclaimer: string;
 }
 

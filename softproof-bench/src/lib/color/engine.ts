@@ -198,6 +198,16 @@ export interface SampleInfo {
   targetColorSpace: ColorSpaceKind;
 }
 
+/** Sample of a rectangular region: mean device values + alpha statistics. */
+export interface RegionSampleInfo extends SampleInfo {
+  /** Clamped region actually sampled, in original-image pixels. */
+  region: { x: number; y: number; w: number; h: number };
+  totalPixels: number;
+  /** Pixels whose alpha is fully 0 (transparent-edge judgement). */
+  transparentPixels: number;
+  meanAlpha8: number;
+}
+
 /** Float64 sampling at one pixel, values normalized from file bit depth. */
 export async function samplePixel(
   decoded: DecodedImage,
@@ -206,21 +216,82 @@ export async function samplePixel(
   x: number,
   y: number,
 ): Promise<SampleInfo> {
+  const norm = normalize(decoded);
+  const idx = y * decoded.width + x;
+  const max = norm.bitDepth === 16 ? 65535 : 255;
+  const stride = norm.colorChannels + (norm.hasAlpha ? 1 : 0);
+  const vals: number[] = [];
+  for (let c = 0; c < norm.colorChannels; c++) vals.push(norm.view[idx * stride + c] / max);
+  let alpha8 = 255;
+  if (norm.hasAlpha) {
+    const a = norm.view[idx * stride + norm.colorChannels];
+    alpha8 = norm.bitDepth === 16 ? (a as number) >> 8 : (a as number);
+  }
+  return sampleDeviceValues(profiles, params, vals, alpha8);
+}
+
+/**
+ * Float64 sampling over a rectangle (original-image coordinates, clamped to
+ * the image). Device values are the unweighted mean over the region; alpha
+ * statistics let the operator judge transparent edges. Used by focus points.
+ */
+export async function sampleRegion(
+  decoded: DecodedImage,
+  profiles: ProfileSet,
+  params: EngineParams,
+  rx: number,
+  ry: number,
+  rw: number,
+  rh: number,
+): Promise<RegionSampleInfo> {
+  const norm = normalize(decoded);
+  const x0 = Math.max(0, Math.min(decoded.width - 1, Math.floor(rx)));
+  const y0 = Math.max(0, Math.min(decoded.height - 1, Math.floor(ry)));
+  const x1 = Math.max(x0 + 1, Math.min(decoded.width, Math.ceil(rx + rw)));
+  const y1 = Math.max(y0 + 1, Math.min(decoded.height, Math.ceil(ry + rh)));
+  const stride = norm.colorChannels + (norm.hasAlpha ? 1 : 0);
+  const max = norm.bitDepth === 16 ? 65535 : 255;
+  const sum = new Array<number>(norm.colorChannels).fill(0);
+  let alphaSum = 0;
+  let transparentPixels = 0;
+  let totalPixels = 0;
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      const idx = (y * decoded.width + x) * stride;
+      for (let c = 0; c < norm.colorChannels; c++) sum[c] += norm.view[idx + c] / max;
+      let a8 = 255;
+      if (norm.hasAlpha) {
+        const a = norm.view[idx + norm.colorChannels];
+        a8 = norm.bitDepth === 16 ? (a as number) >> 8 : (a as number);
+      }
+      alphaSum += a8;
+      if (a8 === 0) transparentPixels++;
+      totalPixels++;
+    }
+  }
+  const vals = sum.map((s) => s / totalPixels);
+  const meanAlpha8 = alphaSum / totalPixels;
+  const base = await sampleDeviceValues(profiles, params, vals, Math.round(meanAlpha8));
+  return {
+    ...base,
+    region: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 },
+    totalPixels,
+    transparentPixels,
+    meanAlpha8,
+  };
+}
+
+/** Shared float64 chain: normalized source device values -> Lab + target. */
+async function sampleDeviceValues(
+  profiles: ProfileSet,
+  params: EngineParams,
+  vals: number[],
+  alpha8: number,
+): Promise<SampleInfo> {
   const lcms = await getMod();
   const src = openProfile(lcms, profiles.source.bytes, 'source');
   const dst = openProfile(lcms, profiles.target.bytes, 'target');
   const lab = { handle: lcms.cmsCreateLab4Profile() };
-
-  const norm = normalize(decoded);
-  const idx = y * decoded.width + x;
-  const max = norm.bitDepth === 16 ? 65535 : 255;
-  const vals: number[] = [];
-  for (let c = 0; c < norm.colorChannels; c++) vals.push(norm.view[idx * (norm.colorChannels + (norm.hasAlpha ? 1 : 0)) + c] / max);
-  let alpha8 = 255;
-  if (norm.hasAlpha) {
-    const a = norm.view[idx * (norm.colorChannels + 1) + norm.colorChannels];
-    alpha8 = norm.bitDepth === 16 ? (a as number) >> 8 : (a as number);
-  }
 
   const sourceLab = transformDouble({
     mod: lcms,

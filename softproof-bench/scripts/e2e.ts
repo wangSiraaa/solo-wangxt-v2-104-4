@@ -13,6 +13,12 @@
  *  7. export TIFF (CMYK target)
  *  8. re-import the converted export -> blocked as already-converted
  *  9. transparent borders survive
+ * 10. focus points: transparent edge + color block sampling, zoom-stable marks
+ * 11. condition change -> old judgement kept as history, explicit re-review
+ * 12. project save/reload -> focus points, notes, statuses restored
+ * 13. different image / fingerprint mismatch -> old points never auto-applied
+ * 14. late async sample results never resurrect deleted points or pollute a
+ *     switched context
  */
 import { chromium, type Browser, type Page } from 'playwright';
 import { readFileSync, existsSync } from 'node:fs';
@@ -51,6 +57,41 @@ async function importImage(page: Page, file: string) {
   const input = page.locator('input[type=file][accept*="png"]').first();
   await input.setInputFiles(file);
 }
+
+/** Click the center of image pixel (px,py) on canvas #index (12x8 fixtures). */
+async function clickCanvasPixel(page: Page, index: number, px: number, py: number, imgW = 12, imgH = 8) {
+  const canvas = page.locator('canvas').nth(index);
+  const box = await canvas.boundingBox();
+  const sx = box!.width / imgW;
+  const sy = box!.height / imgH;
+  await page.mouse.click(box!.x + (px + 0.5) * sx, box!.y + (py + 0.5) * sy);
+}
+
+/** Drag a rectangle from pixel (x0,y0) to pixel (x1,y1) on canvas #index. */
+async function dragCanvasRect(
+  page: Page,
+  index: number,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  imgW = 12,
+  imgH = 8,
+) {
+  const canvas = page.locator('canvas').nth(index);
+  const box = await canvas.boundingBox();
+  const sx = box!.width / imgW;
+  const sy = box!.height / imgH;
+  await page.mouse.move(box!.x + (x0 + 0.5) * sx, box!.y + (y0 + 0.5) * sy);
+  await page.mouse.down();
+  await page.mouse.move(box!.x + (x1 + 0.5) * sx, box!.y + (y1 + 0.5) * sy, { steps: 6 });
+  await page.mouse.up();
+}
+
+const pageErrors = (page: Page) =>
+  (page as unknown as { __errs: string[] }).__errs.filter(
+    (e) => !e.includes('Failed to load resource') && !e.includes('favicon'),
+  );
 
 async function runConvert(page: Page) {
   const btn = page.getByRole('button', { name: /执行 ICC 转换/ });
@@ -240,6 +281,230 @@ async function main() {
     });
     ok('16-bit source proof canvas alpha preserved', info16.corner[3] === 0, JSON.stringify(info16.corner));
     ok('16-bit dimensions kept', info16.w === 12 && info16.h === 8, JSON.stringify(info16));
+    await page.close();
+  }
+
+  // ---------- Scenario G–J: focus points full lifecycle ----------
+  {
+    const page = await freshPage(browser);
+    console.log('# G. focus points: transparent edge + color block, zoom-stable');
+    await importImage(page, resolve(FIX, 'patches-srgb.png'));
+    await page.waitForSelector('.badge.embedded');
+
+    // point focus on the transparent corner (0,0)
+    await page.getByRole('button', { name: /＋ 点关注点/ }).click();
+    await clickCanvasPixel(page, 0, 0, 0);
+    await page.waitForSelector('.focuscard');
+    ok('focus point card created', (await page.locator('.focuscard').count()) === 1);
+    const card1 = page.locator('.focuscard').first();
+    ok('point coords in original-image pixels', (await card1.locator('.coords').innerText()).includes('(0, 0)'));
+    ok('image fingerprint bound', (await card1.locator('.hash').innerText()).includes('指纹'));
+    await page.waitForFunction(
+      () => document.querySelector('.focuscard')?.textContent?.includes('透明像素'),
+      null,
+      { timeout: 20000 },
+    );
+    const t1 = await card1.innerText();
+    ok('transparent corner: alpha 0 sampled', t1.includes('均值 0.0 / 255') && t1.includes('透明像素 1/1'), t1.slice(0, 300));
+    ok('point ΔE shown', t1.includes('ΔE00'));
+
+    // rect focus on the interior red block (1,1)-(3,2)
+    await page.getByRole('button', { name: /＋ 区域关注点/ }).click();
+    await dragCanvasRect(page, 0, 1, 1, 3, 2);
+    await page.waitForFunction(() => document.querySelectorAll('.focuscard').length === 2);
+    const card2 = page.locator('.focuscard').nth(1);
+    await page.waitForFunction(
+      () => document.querySelectorAll('.focuscard')[1]?.textContent?.includes('透明像素'),
+      null,
+      { timeout: 20000 },
+    );
+    const t2 = await card2.innerText();
+    ok('rect coords in original-image pixels', t2.includes('(1, 1)') && t2.includes('3×2'), t2.slice(0, 200));
+    ok('red block: opaque, source R 100%', t2.includes('透明像素 0/6') && t2.includes('R 100.0%'), t2.slice(0, 300));
+    ok('rect drag did not leave a stray pin', (await page.locator('.pinbox').count()) === 0);
+
+    // markers render on both canvases after conversion and track zoom
+    await runConvert(page);
+    await page.waitForTimeout(800);
+    ok('focus marks on both canvases', (await page.locator('.focusDot').count()) >= 2 && (await page.locator('.focusRect').count()) >= 2);
+    await page.setViewportSize({ width: 1100, height: 760 });
+    await page.waitForTimeout(400);
+    const align = await page.evaluate(() => {
+      const canvas = document.querySelector('canvas')!;
+      const cb = canvas.getBoundingClientRect();
+      const dot = document.querySelector('.focusDot')!.getBoundingClientRect();
+      const sx = cb.width / 12;
+      const sy = cb.height / 8;
+      return {
+        dx: Math.abs(dot.x + dot.width / 2 - (cb.x + 0.5 * sx)),
+        dy: Math.abs(dot.y + dot.height / 2 - (cb.y + 0.5 * sy)),
+      };
+    });
+    ok('focus mark stays on its pixel after zoom/resize', align.dx < 2 && align.dy < 2, JSON.stringify(align));
+    await page.setViewportSize({ width: 1600, height: 980 });
+    await page.waitForTimeout(300);
+
+    console.log('# H. condition change -> history kept, explicit re-review');
+    // judge the point under the current conditions first
+    await card1.locator('select.focus-status').selectOption('pass');
+    await card1.locator('input.focus-note').fill('品牌色可接受');
+    await card1.locator('input.focus-note').press('Tab');
+    // change rendering intent -> conditions change
+    await page.locator('label.field', { hasText: '渲染意图' }).locator('select').selectOption('perceptual');
+    await page.waitForTimeout(300);
+    ok(
+      'no current judgement after condition change',
+      (await card1.locator('.panel-warn').count()) === 1 &&
+        (await card1.locator('.panel-warn').innerText()).includes('尚无判定'),
+    );
+    ok('old judgement cannot masquerade: no status editor', (await card1.locator('select.focus-status').count()) === 0);
+    const hist1 = await card1.innerText();
+    ok('old judgement kept as history', hist1.includes('判定历史（1 个版本）') && hist1.includes('品牌色可接受'), hist1.slice(0, 400));
+    ok('old status visible in history', hist1.includes('通过'));
+    ok('rect point also lost current judgement', (await card2.locator('.panel-warn').count()) === 1);
+
+    // explicit re-review under the new conditions
+    await card1.getByRole('button', { name: /按当前条件复核/ }).click();
+    await page.waitForSelector('.focuscard select.focus-status', { timeout: 20000 });
+    ok('re-review samples under new conditions', (await card1.locator('select.focus-status').count()) === 1);
+    const hist2 = await card1.innerText();
+    ok('history now has two versions', hist2.includes('判定历史（2 个版本）'), hist2.slice(0, 200));
+    await card1.locator('.history summary').click();
+    const hist2open = await card1.innerText();
+    ok('old note survives re-review', hist2open.includes('品牌色可接受'));
+
+    console.log('# I. save + reload -> focus points, notes, statuses restored');
+    await card1.locator('select.focus-status').selectOption('watch');
+    await card1.locator('input.focus-note').fill('复核后仍可接受');
+    await card1.locator('input.focus-note').press('Tab');
+    await page.locator('input[placeholder*="工程名称"]').fill('焦点测试工程');
+    await page.getByRole('button', { name: '保存工程' }).click();
+    await page.waitForSelector('text=工程已保存');
+    await page.reload();
+    await page.waitForSelector('.sidebar', { timeout: 15000 });
+    await page.getByRole('button', { name: /焦点测试工程/ }).click();
+    await page.waitForSelector('text=已载入工程');
+    await page.waitForFunction(() => document.querySelectorAll('.focuscard').length === 2, null, { timeout: 15000 });
+    const rcard1 = page.locator('.focuscard').first();
+    const rcard2 = page.locator('.focuscard').nth(1);
+    ok('reloaded: two focus points restored', (await page.locator('.focuscard').count()) === 2);
+    ok('reloaded: coords intact', (await rcard1.locator('.coords').innerText()).includes('(0, 0)'));
+    ok('reloaded: status restored', (await rcard1.locator('select.focus-status').inputValue()) === 'watch');
+    ok('reloaded: note restored', (await rcard1.locator('input.focus-note').inputValue()) === '复核后仍可接受');
+    const rt1 = await rcard1.innerText();
+    ok('reloaded: persisted sample shown (transparent corner)', rt1.includes('透明像素 1/1'), rt1.slice(0, 300));
+    await rcard1.locator('.history summary').click();
+    ok('reloaded: judgement history intact', (await rcard1.innerText()).includes('品牌色可接受'));
+    const rt2 = await rcard2.innerText();
+    ok(
+      'reloaded: rect old judgement stays history, not current',
+      rt2.includes('尚无判定') && rt2.includes('判定历史（1 个版本）'),
+      rt2.slice(0, 300),
+    );
+
+    console.log('# I2. export settings record keeps judgement history boundary');
+    await runConvert(page);
+    await page.waitForTimeout(600);
+    await exportPair(page);
+    const recJson = JSON.parse(readFileSync(resolve(ROOT, 'test-out', 'patches-srgb.proof-settings.json'), 'utf8')) as {
+      transform: { intent: string };
+      target: { id: string };
+      focusPoints?: {
+        kind: string;
+        x: number;
+        y: number;
+        imageHash: string;
+        evaluations: { isCurrent: boolean; note: string; conditions: { intent: string } }[];
+      }[];
+    };
+    ok('record carries focus points', Array.isArray(recJson.focusPoints) && recJson.focusPoints.length === 2);
+    const rp1 = recJson.focusPoints?.find((q) => q.kind === 'point');
+    ok(
+      'record: point coords + fingerprint',
+      !!rp1 && rp1.x === 0 && rp1.y === 0 && typeof rp1.imageHash === 'string' && rp1.imageHash.length === 16,
+    );
+    ok('record: full history exported', (rp1?.evaluations.length ?? 0) === 2);
+    const curEvals = rp1?.evaluations.filter((e) => e.isCurrent) ?? [];
+    ok('record: exactly one current version', curEvals.length === 1);
+    ok(
+      'record: current version matches export conditions',
+      curEvals[0]?.conditions.intent === recJson.transform.intent,
+    );
+    ok(
+      'record: historical version keeps old conditions + note',
+      !!rp1?.evaluations.some((e) => !e.isCurrent && e.note === '品牌色可接受' && e.conditions.intent === 'relative-colorimetric'),
+    );
+    ok(
+      'record: rect judgement is historical only',
+      (recJson.focusPoints?.find((q) => q.kind === 'rect')?.evaluations ?? []).every((e) => !e.isCurrent),
+    );
+
+    console.log('# J. different image -> old focus points never auto-applied');
+    await importImage(page, resolve(FIX, 'patches-noicc.png'));
+    await page.waitForSelector('text=缺少嵌入');
+    ok('focus points cleared on image switch', (await page.locator('.focuscard').count()) === 0);
+    ok('focus marks removed from canvases', (await page.locator('.focusDot').count()) === 0 && (await page.locator('.focusRect').count()) === 0);
+    await page.locator('select').filter({ hasText: '请选择源配置' }).first().selectOption({ index: 1 });
+    await page.waitForSelector('.ok');
+    ok('old points do not reappear after source choice', (await page.locator('.focuscard').count()) === 0);
+    ok('no page errors (G–J)', pageErrors(page).length === 0, pageErrors(page).join(' | ').slice(0, 400));
+    await page.close();
+  }
+
+  // ---------- Scenario K: late async sample results are discarded ----------
+  {
+    const page = await freshPage(browser);
+    console.log('# K. late sample results never resurrect or pollute');
+    await importImage(page, resolve(FIX, 'patches-srgb.png'));
+    await page.waitForSelector('.badge.embedded');
+
+    // K1: create a point and delete it before the worker sample returns
+    await page.getByRole('button', { name: /＋ 点关注点/ }).click();
+    await page.evaluate(async () => {
+      const canvas = document.querySelector('canvas')!;
+      const r = canvas.getBoundingClientRect();
+      canvas.dispatchEvent(
+        new MouseEvent('click', { clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, bubbles: true }),
+      );
+      await new Promise((res) => setTimeout(res, 0));
+      (document.querySelector('.focus-del') as HTMLButtonElement | null)?.click();
+    });
+    await page.waitForTimeout(2500);
+    ok('deleted point stays deleted after late sample', (await page.locator('.focuscard').count()) === 0);
+
+    // K2: save a project, create a point, then load the project before the
+    // sample returns — the loaded project must stay clean.
+    await page.locator('input[placeholder*="工程名称"]').fill('空工程');
+    await page.getByRole('button', { name: '保存工程' }).click();
+    await page.waitForSelector('text=工程已保存');
+    await page.getByRole('button', { name: /＋ 点关注点/ }).click();
+    await page.evaluate(async () => {
+      const canvas = document.querySelector('canvas')!;
+      const r = canvas.getBoundingClientRect();
+      canvas.dispatchEvent(
+        new MouseEvent('click', { clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, bubbles: true }),
+      );
+    });
+    await page.locator('button[title="载入工程"]', { hasText: '空工程' }).click();
+    await page.waitForSelector('text=已载入工程');
+    await page.waitForTimeout(2500);
+    ok('project switch: late sample does not pollute loaded project', (await page.locator('.focuscard').count()) === 0);
+
+    // K3: create a point, then switch image before the sample returns
+    await page.getByRole('button', { name: /＋ 点关注点/ }).click();
+    await page.evaluate(async () => {
+      const canvas = document.querySelector('canvas')!;
+      const r = canvas.getBoundingClientRect();
+      canvas.dispatchEvent(
+        new MouseEvent('click', { clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, bubbles: true }),
+      );
+    });
+    await importImage(page, resolve(FIX, 'patches-noicc.png'));
+    await page.waitForSelector('text=缺少嵌入');
+    await page.waitForTimeout(2500);
+    ok('image switch: no focus point materializes', (await page.locator('.focuscard').count()) === 0);
+    ok('image switch: no focus marks left', (await page.locator('.focusDot').count()) === 0);
+    ok('no page errors (K)', pageErrors(page).length === 0, pageErrors(page).join(' | ').slice(0, 400));
     await page.close();
   }
 

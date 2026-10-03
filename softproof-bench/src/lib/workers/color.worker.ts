@@ -6,14 +6,15 @@
  *  -> { type: 'convert', id, imageBytes, sourceIcc, targetIcc, params }
  *  <-  { type: 'result', id, result? , error? }
  *
- *  -> { type: 'sample', id, imageBytes, sourceIcc, targetIcc, params, x, y }
+ *  -> { type: 'sample', id, imageBytes, sourceIcc, targetIcc, params, x, y, w?, h? }
  *  <-  { type: 'sample-result', id, info?, error? }
+ *      (with w/h present the sample is the region mean + alpha statistics)
  *
  * Profiles and images arrive as ArrayBuffers (zero-copy transfer when sent
  * from the caller with a transfer list; here we clone to keep originals).
  */
 import { decodeImage } from '../codec/decode';
-import { convert, samplePixel } from '../color/engine';
+import { convert, samplePixel, sampleRegion } from '../color/engine';
 import type { EngineParams } from '../color/engine';
 
 declare const self: DedicatedWorkerGlobalScope;
@@ -35,6 +36,9 @@ export interface SampleRequest {
   params: EngineParams;
   x: number;
   y: number;
+  /** Optional rectangle (original-image pixels) -> region mean sampling. */
+  w?: number;
+  h?: number;
 }
 export type WorkerRequest = ConvertRequest | SampleRequest;
 
@@ -59,7 +63,10 @@ self.onmessage = async (ev: MessageEvent<WorkerRequest>) => {
         transferableOf(result),
       );
     } else {
-      const info = await samplePixel(decoded, profiles, msg.params, msg.x, msg.y);
+      const info =
+        msg.w != null && msg.h != null
+          ? await sampleRegion(decoded, profiles, msg.params, msg.x, msg.y, msg.w, msg.h)
+          : await samplePixel(decoded, profiles, msg.params, msg.x, msg.y);
       self.postMessage({ type: 'sample-result', id: msg.id, info });
     }
   } catch (err) {

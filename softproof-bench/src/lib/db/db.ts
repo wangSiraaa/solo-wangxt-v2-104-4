@@ -8,6 +8,7 @@
  */
 import type { RenderingIntent } from '../color/lcms';
 import type { ColorSpaceKind } from '../icc/profileInfo';
+import type { FocusPoint } from '../color/focus';
 
 const DB_NAME = 'softproof-bench';
 const DB_VERSION = 1;
@@ -39,7 +40,13 @@ export interface StoredProject {
   targetProfileId: string | null;
   intent: RenderingIntent;
   blackPointCompensation: boolean;
+  proofIntent?: RenderingIntent;
   provenanceSeen?: boolean; // image already carried a conversion marker
+  /**
+   * 校样关注点：完整判定历史随工程一起持久化；每条判定自带打样条件快照，
+   * 载入时按原图内容指纹过滤，指纹不匹配的点一律不恢复。
+   */
+  focusPoints?: FocusPoint[];
   previewCache?: {
     paramsKey: string;
     rgba: Uint8Array;

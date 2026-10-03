@@ -11,9 +11,23 @@ import { seedBuiltinProfiles } from './builtinProfiles';
 import { extractEmbeddedICC, detectContainer } from '../icc/extractEmbedded';
 import { readProfileInfo, type ProfileInfo, type ColorSpaceKind } from '../icc/profileInfo';
 import { detectProvenance } from '../icc/provenance';
-import { runConvert, runSample, type ConvertedPayload } from '../workers/client';
-import type { EngineParams, SampleInfo } from '../color/engine';
+import { runConvert, runSample, runSampleRegion, type ConvertedPayload } from '../workers/client';
+import type { EngineParams, RegionSampleInfo, SampleInfo } from '../color/engine';
 import type { RenderingIntent } from '../color/lcms';
+import { fnv1a64 } from '../color/hash';
+import { deltaE2000, fromTriple } from '../color/colorMath';
+import {
+  conditionsKeyOf,
+  evaluationAcceptsResult,
+  evaluationForConditions,
+  focusAppliesToImage,
+  reviveFocusPoint,
+  serializeFocusPoint,
+  type FocusEvaluation,
+  type FocusPoint,
+  type FocusStatus,
+  type ProofConditions,
+} from '../color/focus';
 
 export type SourceStatus =
   | { kind: 'none' }
@@ -68,7 +82,22 @@ function createAppState() {
     busyProfiles: false,
     notice: '' as string,
     showOriginalManaged: true,
+    /** fnv1a64 fingerprint of the current original image bytes. */
+    imageHash: '' as string,
+    /** 校样关注点：仅属于当前原图（按内容指纹绑定）。 */
+    focusPoints: [] as FocusPoint[],
+    /** 画布建点模式：单击建点 / 拖拽建区域。 */
+    focusMode: null as 'point' | 'rect' | null,
   });
+
+  /**
+   * Bumped whenever the working context is replaced (new image import or
+   * project load). Async focus samples capture the epoch at dispatch and are
+   * discarded on arrival when it no longer matches, so a late result can
+   * never land on a deleted point or leak into another project.
+   */
+  let focusEpoch = 0;
+  let focusSeq = 0;
 
   async function init() {
     try {
@@ -117,6 +146,13 @@ function createAppState() {
     state.convertError = '';
     state.sourceAssumed = false;
     state.sourceProfile = null;
+    // 换图即换工作上下文：关注点绑定原图内容指纹，绝不自动套用到新图；
+    // 递增 epoch 使旧图尚未返回的取样结果全部作废。
+    focusEpoch++;
+    focusSeq = 0;
+    state.imageHash = fnv1a64(bytes);
+    state.focusPoints = [];
+    state.focusMode = null;
 
     if (embedded && info?.valid) {
       // Profile the pixels were actually tagged with; record identity for display.
@@ -167,6 +203,193 @@ function createAppState() {
   );
 
   const needsSourceChoice = $derived(!!state.image && !state.image.embedded && !state.sourceAssumed);
+
+  /** Live proofing conditions; null until source+target are both decided. */
+  function currentConditions(): ProofConditions | null {
+    if (!state.image || !state.sourceProfile || !state.targetProfile) return null;
+    return {
+      sourceProfileId: state.sourceProfile.id,
+      sourceProfileDescription: state.sourceProfile.description,
+      sourceIsEmbedded: !!state.image.embedded && !state.sourceAssumed,
+      sourceAssumed: state.sourceAssumed,
+      targetProfileId: state.targetProfile.id,
+      targetProfileDescription: state.targetProfile.description,
+      targetColorSpace: state.targetProfile.colorSpace,
+      intent: state.intent,
+      blackPointCompensation: state.blackPointCompensation,
+      proofIntent: state.proofIntent,
+    };
+  }
+
+  /** Signature of the live proofing conditions (matches FocusEvaluation.conditionsKey). */
+  const conditionsKey = $derived.by(() => {
+    const c = currentConditions();
+    return c ? conditionsKeyOf(c) : '';
+  });
+
+  // ---------------- 校样关注点 ----------------
+
+  function armFocus(mode: 'point' | 'rect') {
+    state.focusMode = state.focusMode === mode ? null : mode;
+  }
+
+  function newEvaluation(cond: ProofConditions): FocusEvaluation {
+    return {
+      id: newId('fe'),
+      createdAt: new Date().toISOString(),
+      conditions: cond,
+      conditionsKey: conditionsKeyOf(cond),
+      sample: null,
+      deltaE: null,
+      status: 'pending',
+      note: '',
+      pending: true,
+    };
+  }
+
+  /**
+   * Create a focus point/region in ORIGINAL IMAGE coordinates and sample it
+   * under the current conditions. The evaluation is bound to the condition
+   * snapshot taken right now; later condition changes cannot rewrite it.
+   */
+  function addFocus(kind: 'point' | 'rect', x: number, y: number, w: number, h: number, imgW: number, imgH: number) {
+    const cond = currentConditions();
+    if (!state.image || !cond) {
+      state.notice = '请先确定源配置与目标配置，再建立校样关注点。';
+      return;
+    }
+    state.focusMode = null; // one-shot arming
+    const cx = Math.max(0, Math.min(imgW - 1, Math.round(x)));
+    const cy = Math.max(0, Math.min(imgH - 1, Math.round(y)));
+    const cw = Math.max(1, Math.min(imgW - cx, Math.round(w)));
+    const ch = Math.max(1, Math.min(imgH - cy, Math.round(h)));
+    focusSeq++;
+    const point: FocusPoint = {
+      id: newId('fp'),
+      createdAt: new Date().toISOString(),
+      kind,
+      x: cx,
+      y: cy,
+      w: kind === 'point' ? 1 : cw,
+      h: kind === 'point' ? 1 : ch,
+      label: kind === 'point' ? `点 ${focusSeq}` : `区域 ${focusSeq}`,
+      imageHash: state.imageHash,
+      imageName: state.image.name,
+      imageWidth: imgW,
+      imageHeight: imgH,
+      evaluations: [],
+    };
+    point.evaluations.push(newEvaluation(cond));
+    state.focusPoints.push(point);
+    dispatchEvalSample(point.id, point.evaluations[0].id);
+  }
+
+  function removeFocus(id: string) {
+    const i = state.focusPoints.findIndex((p) => p.id === id);
+    if (i >= 0) state.focusPoints.splice(i, 1);
+    // 该点尚未返回的取样会在到达时被守卫丢弃，不会复活此点。
+  }
+
+  /**
+   * 复核：在当前打样条件下取样判定。同条件已存在判定时就地刷新取样
+   * （同一条件快照，判定与备注保留）；条件已变更则追加新版本，旧判定
+   * 保留为只读历史。
+   */
+  function reviewFocus(id: string) {
+    const cond = currentConditions();
+    if (!cond) return;
+    const p = state.focusPoints.find((q) => q.id === id);
+    if (!p) return;
+    const key = conditionsKeyOf(cond);
+    const existing = p.evaluations.find((e) => e.conditionsKey === key);
+    if (existing) {
+      existing.pending = true;
+      existing.error = undefined;
+      dispatchEvalSample(p.id, existing.id);
+    } else {
+      const ev = newEvaluation(cond);
+      p.evaluations.push(ev);
+      dispatchEvalSample(p.id, ev.id);
+    }
+  }
+
+  /** The evaluation valid under the live conditions (undefined => history only). */
+  function currentEvaluationOf(p: FocusPoint): FocusEvaluation | undefined {
+    return evaluationForConditions(p, conditionsKey);
+  }
+
+  function setFocusStatus(pointId: string, status: FocusStatus) {
+    const p = state.focusPoints.find((q) => q.id === pointId);
+    if (!p) return;
+    const e = currentEvaluationOf(p);
+    // 只有当前条件版本可判定；历史版本只读，不能原地改写。
+    if (!e || e.pending || !e.sample) return;
+    e.status = status;
+  }
+
+  function setFocusNote(pointId: string, note: string) {
+    const p = state.focusPoints.find((q) => q.id === pointId);
+    if (!p) return;
+    const e = currentEvaluationOf(p);
+    if (!e || e.pending) return;
+    e.note = note;
+  }
+
+  /**
+   * Dispatch the async region sample for one evaluation. Everything the
+   * worker needs is captured NOW (image bytes, profiles, params) so the
+   * computation always matches the evaluation's own condition snapshot,
+   * regardless of what the operator changes while it runs.
+   */
+  function dispatchEvalSample(pointId: string, evalId: string) {
+    if (!state.image || !state.sourceProfile || !state.targetProfile) return;
+    const p = state.focusPoints.find((q) => q.id === pointId);
+    if (!p) return;
+    const epoch = focusEpoch;
+    const hash = state.imageHash;
+    const params: EngineParams = {
+      intent: state.intent,
+      blackPointCompensation: state.blackPointCompensation,
+      proofIntent: state.proofIntent,
+    };
+    const req = {
+      imageBytes: state.image.bytes,
+      sourceIcc: state.sourceProfile.bytes,
+      targetIcc: state.targetProfile.bytes,
+      params,
+      x: p.x,
+      y: p.y,
+      w: p.w,
+      h: p.h,
+    };
+    void runSampleRegion(req)
+      .then((info) => applyEvalResult(pointId, evalId, epoch, hash, info, undefined))
+      .catch((err) => applyEvalResult(pointId, evalId, epoch, hash, null, String(err)));
+  }
+
+  /** Late-result guard: drop anything whose context has moved on. */
+  function applyEvalResult(
+    pointId: string,
+    evalId: string,
+    epoch: number,
+    hash: string,
+    info: RegionSampleInfo | null,
+    error: string | undefined,
+  ) {
+    if (epoch !== focusEpoch) return; // 工程/原图已切换
+    if (hash !== state.imageHash) return; // 内容指纹不匹配
+    const p = state.focusPoints.find((q) => q.id === pointId);
+    const e = evaluationAcceptsResult(p, evalId); // 已删除或已被取代 -> 丢弃
+    if (!e) return;
+    if (info) {
+      e.sample = info;
+      e.deltaE = deltaE2000(fromTriple(info.sourceLab), fromTriple(info.targetLab));
+      e.error = undefined;
+    } else {
+      e.error = error ?? '取样失败';
+    }
+    e.pending = false;
+  }
 
   async function convertNow() {
     if (!state.image || !state.sourceProfile || !state.targetProfile) return;
@@ -275,7 +498,11 @@ function createAppState() {
       targetProfileId: state.targetProfile?.id ?? null,
       intent: state.intent,
       blackPointCompensation: state.blackPointCompensation,
+      proofIntent: state.proofIntent,
       provenanceSeen: state.image.provenance.converted,
+      // 关注点随工程持久化：完整判定历史（每条自带条件快照），
+      // 运行时 pending 标记在序列化时剥离。
+      focusPoints: state.focusPoints.map(serializeFocusPoint),
     };
     await idbPut(STORE_PROJECTS, p);
     state.projects = (await idbAll<StoredProject>(STORE_PROJECTS)).map((x) => ({
@@ -290,6 +517,9 @@ function createAppState() {
   async function loadProject(id: string) {
     const p = await idbGetProject(id);
     if (!p) return;
+    // 切换工程 = 切换工作上下文：旧工程未返回的取样一律作废。
+    focusEpoch++;
+    focusSeq = 0;
     const embedded = p.embeddedICC ?? null;
     state.image = {
       bytes: p.imageBytes,
@@ -299,6 +529,7 @@ function createAppState() {
       embedded,
       provenance: detectProvenance(p.imageBytes),
     };
+    state.imageHash = fnv1a64(p.imageBytes);
     const all = await idbAll<StoredProfile>(STORE_PROFILES);
     state.profiles = all.sort((a, b) => a.description.localeCompare(b.description));
     if (p.sourceIsEmbedded && embedded) {
@@ -324,8 +555,17 @@ function createAppState() {
     state.targetProfile = all.find((x) => x.id === p.targetProfileId) ?? null;
     state.intent = p.intent;
     state.blackPointCompensation = p.blackPointCompensation;
+    state.proofIntent = p.proofIntent ?? 'relative-colorimetric';
+    // 关注点按内容指纹恢复：指纹不匹配（换了原图）的点一律不套用。
+    const storedFocus = p.focusPoints ?? [];
+    state.focusPoints = storedFocus.filter((fp) => focusAppliesToImage(fp, state.imageHash)).map(reviveFocusPoint);
+    focusSeq = state.focusPoints.length;
+    state.focusMode = null;
     invalidate();
-    state.notice = `已载入工程：${p.name}`;
+    state.notice =
+      storedFocus.length > state.focusPoints.length
+        ? `已载入工程：${p.name}（${storedFocus.length - state.focusPoints.length} 个关注点因原图指纹不匹配未恢复）`
+        : `已载入工程：${p.name}`;
   }
 
   async function deleteProject(id: string) {
@@ -357,11 +597,21 @@ function createAppState() {
     loadProject,
     deleteProject,
     deleteProfile,
+    armFocus,
+    addFocus,
+    removeFocus,
+    reviewFocus,
+    currentEvaluationOf,
+    setFocusStatus,
+    setFocusNote,
     get needsSourceChoice() {
       return needsSourceChoice;
     },
     get paramsKey() {
       return paramsKey;
+    },
+    get conditionsKey() {
+      return conditionsKey;
     },
   };
 }

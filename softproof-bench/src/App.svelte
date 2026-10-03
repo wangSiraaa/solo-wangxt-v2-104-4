@@ -4,6 +4,7 @@
   import ProjectsPanel from './lib/components/ProjectsPanel.svelte';
   import CanvasView from './lib/components/CanvasView.svelte';
   import Sampler from './lib/components/Sampler.svelte';
+  import FocusPoints from './lib/components/FocusPoints.svelte';
   import ExportBar from './lib/components/ExportBar.svelte';
   import { PROFILE_ATTRIBUTION } from './lib/db/builtinProfiles';
   import type { SampleInfo } from './lib/color/engine';
@@ -81,6 +82,26 @@
   function clearNotice() {
     s.notice = '';
   }
+
+  // 关注点标记：存储的是原图像素坐标，渲染时由 CanvasView 乘以当前缩放，
+  // 因此缩放或切换预览都不会让标记漂移。stale = 当前打样条件下无判定。
+  const focusMarks = $derived(
+    s.focusPoints.map((p) => ({
+      kind: p.kind,
+      x: p.x,
+      y: p.y,
+      w: p.w,
+      h: p.h,
+      stale: !app.currentEvaluationOf(p),
+    })),
+  );
+
+  function addFocusPoint(x: number, y: number) {
+    app.addFocus('point', x, y, 1, 1, origDims.w, origDims.h);
+  }
+  function addFocusRect(x: number, y: number, w: number, h: number) {
+    app.addFocus('rect', x, y, w, h, origDims.w, origDims.h);
+  }
 </script>
 
 <main class="layout">
@@ -134,6 +155,10 @@
             onmove={onMove}
             onleave={onLeave}
             onpin={(x, y) => app.pin(x, y)}
+            focusMode={s.focusMode}
+            {focusMarks}
+            onfocuspoint={addFocusPoint}
+            onfocusrect={addFocusRect}
             accent="#8fd3ff"
           />
           <CanvasView
@@ -150,6 +175,10 @@
             onmove={onMove}
             onleave={onLeave}
             onpin={(x, y) => app.pin(x, y)}
+            focusMode={s.focusMode}
+            {focusMarks}
+            onfocuspoint={addFocusPoint}
+            onfocusrect={addFocusRect}
             accent="#ffb454"
           />
         </div>
@@ -162,12 +191,14 @@
           pins={s.pins.map((p) => ({ x: p.x, y: p.y, info: p.info ?? null, pending: p.pending, error: p.error }))}
           onremove={(i: number) => app.removePin(i)}
         />
+        <FocusPoints {app} />
         <div class="panel stack">
           <h2>流程纪律</h2>
           <ol class="small rules">
             <li>先看原图有没有嵌入配置；没有则必须人工指定源配置，假设写入记录。</li>
             <li>再选印厂目标配置、渲染意图与黑点补偿。</li>
             <li>右侧为目标→显示器的软打样模拟；只用于预览，不回灌转换。</li>
+            <li>关注点绑定原图指纹与打样条件；条件变更后旧判定留作历史，需显式复核。</li>
             <li>导出图像嵌入目标 ICC 并带“已转换”标记；设置记录单独成文件。</li>
             <li>再次导入带标记文件会被拦截，防止二次转换。</li>
           </ol>

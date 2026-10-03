@@ -4,7 +4,7 @@
  * project is never detached.
  */
 import ColorWorker from './color.worker.ts?worker';
-import type { EngineParams, SampleInfo } from '../color/engine';
+import type { EngineParams, RegionSampleInfo, SampleInfo } from '../color/engine';
 import type { ColorSpaceKind } from '../icc/profileInfo';
 
 export interface ConvertedPayload {
@@ -113,6 +113,37 @@ export function runSample(opts: {
     params: opts.params,
     x: opts.x,
     y: opts.y,
+  };
+  return new Promise((resolve, reject) => {
+    pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
+    w.postMessage(payload, [payload.imageBytes, payload.sourceIcc, payload.targetIcc]);
+  });
+}
+
+/** Region mean sample (focus points); rect in original-image pixels. */
+export function runSampleRegion(opts: {
+  imageBytes: Uint8Array;
+  sourceIcc: Uint8Array;
+  targetIcc: Uint8Array;
+  params: EngineParams;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}): Promise<RegionSampleInfo> {
+  const w = ensureWorker();
+  const id = seq++;
+  const payload = {
+    type: 'sample' as const,
+    id,
+    imageBytes: copy(ab(opts.imageBytes)),
+    sourceIcc: copy(ab(opts.sourceIcc)),
+    targetIcc: copy(ab(opts.targetIcc)),
+    params: opts.params,
+    x: opts.x,
+    y: opts.y,
+    w: opts.w,
+    h: opts.h,
   };
   return new Promise((resolve, reject) => {
     pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
